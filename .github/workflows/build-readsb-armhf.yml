@@ -78,8 +78,8 @@ jobs:
           install: |
             apt-get update
             apt-get install -y --no-install-recommends \
-              build-essential pkg-config ca-certificates \
-              librtlsdr-dev libusb-1.0-0-dev zlib1g-dev file
+              build-essential pkg-config ca-certificates git \
+              librtlsdr-dev libusb-1.0-0-dev zlib1g-dev libzstd-dev file
           run: |
             set -eux
             cd /src
@@ -170,5 +170,6 @@ jobs:
               merge --no-edit upstream/dev -m "chore: sync dev from wiedehopf/readsb" || {
                 echo "merge conflict, skip sync"; exit 0; }
           git push --quiet origin HEAD:dev && echo "synced"
+
 
 
