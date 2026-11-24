@@ -1,0 +1,174 @@
+name: readsb armhf auto-build
+
+# 每天 UTC 03:00（北京 11:00）检查上游 tag，有新版本才编译
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '强制编译指定 ref（留空 = 自动取上游最新 tag）'
+        default: ''
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: readsb-armhf
+  cancel-in-progress: false
+
+jobs:
+  # ── 1. 查上游最新 tag，判断要不要编译 ──────────────────────────────
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      ref: ${{ steps.pick.outputs.ref }}
+      need: ${{ steps.pick.outputs.need }}
+    steps:
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCED: ${{ inputs.ref }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -n "${FORCED:-}" ]; then
+            ref="$FORCED"
+          else
+            ref=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                  "https://api.github.com/repos/wiedehopf/readsb/tags?per_page=1" \
+                  | jq -r '.[0].name')
+          fi
+          echo "upstream latest tag: $ref"
+          # 幂等：这个版本已经发过 Release 就跳过
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" \
+                 "https://api.github.com/repos/$REPO/releases/tags/armhf-$ref")
+          echo "existing release check -> HTTP $code"
+          if [ "$code" = "200" ]; then
+            echo "need=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "need=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+  # ── 2. 在 armv7 容器里编译（qemu 模拟）────────────────────────────
+  build:
+    needs: check
+    if: needs.check.outputs.need == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout readsb source
+        uses: actions/checkout@v4
+        with:
+          repository: wiedehopf/readsb
+          ref: ${{ needs.check.outputs.ref }}
+          path: src
+          fetch-depth: 1
+
+      - name: Build inside armv7 (qemu) container
+        uses: uraimo/run-on-arch-action@v2
+        with:
+          arch: armv7
+          distro: bookworm
+          githubToken: ${{ github.token }}
+          dockerRunArgs: |
+            --volume "${PWD}/src:/src"
+          install: |
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              build-essential pkg-config ca-certificates \
+              librtlsdr-dev libusb-1.0-0-dev zlib1g-dev file
+          run: |
+            set -eux
+            cd /src
+            uname -m
+            make -j"$(nproc)" RTLSDR=yes
+            file readsb
+            ./readsb --version || true
+            mkdir -p out
+            cp readsb out/readsb-armhf
+            cd out
+            sha256sum readsb-armhf | tee readsb-armhf.sha256
+            ls -l
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: readsb-armhf-${{ needs.check.outputs.ref }}
+          path: |
+            src/out/readsb-armhf
+            src/out/readsb-armhf.sha256
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: armhf-${{ needs.check.outputs.ref }}
+          name: readsb armhf ${{ needs.check.outputs.ref }}
+          body: |
+            readsb 预编译二进制（armv7 / armhf）
+
+            - 上游：`wiedehopf/readsb` @ `${{ needs.check.outputs.ref }}`
+            - 构建：GitHub Actions + QEMU（armv7 bookworm 容器）
+            - 依赖：`librtlsdr0`、`libz`（设备上 `apt install librtlsdr0 zlib1g`）
+
+            安装：
+            ```
+            scp readsb-armhf root@<ip>:/usr/local/bin/readsb
+            ssh root@<ip> 'chmod +x /usr/local/bin/readsb && readsb --version'
+            ```
+          files: |
+            src/out/readsb-armhf
+            src/out/readsb-armhf.sha256
+          prerelease: false
+          fail_on_unmatched_files: true
+
+  # ── 3. 通知（可选：配了 NTFY_TOPIC secret 才推送）─────────────────
+  notify:
+    needs: [check, build]
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Push notification
+        env:
+          NTFY: ${{ secrets.NTFY_TOPIC }}
+          REF: ${{ needs.check.outputs.ref }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ -z "${NTFY:-}" ]; then
+            echo "no NTFY_TOPIC secret set, skip notification"; exit 0
+          fi
+          msg="readsb armhf ${REF} 编译完成 → https://github.com/${REPO}/releases/tag/armhf-${REF}"
+          curl -fsS -m 20 -d "$msg" \
+               -H "Title: readsb 新版本就绪" \
+               -H "Tags: airplane" \
+               "https://ntfy.sh/${NTFY}" && echo "notified"
+
+  # ── 4. 把 fork 的 dev 与上游同步（保持 commits 可见）─────────────
+  sync-fork:
+    needs: check
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Fast-forward fork dev from upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth=50 "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" fork
+          cd fork
+          git remote add upstream https://github.com/wiedehopf/readsb.git
+          git fetch --quiet --depth=50 upstream dev
+          if git merge-base --is-ancestor upstream/dev HEAD; then
+            echo "already up to date"; exit 0
+          fi
+          git -c user.name=github-actions -c user.email=actions@github.com \
+              merge --no-edit upstream/dev -m "chore: sync dev from wiedehopf/readsb" || {
+                echo "merge conflict, skip sync"; exit 0; }
+          git push --quiet origin HEAD:dev && echo "synced"
+
+
